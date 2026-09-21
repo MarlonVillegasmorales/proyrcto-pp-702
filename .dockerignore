@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.db
+.git/
+.gitignore
+.venv/
+venv/
+.pytest_cache/
+.streamlit/secrets.toml
+Dockerfile
