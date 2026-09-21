@@ -6,6 +6,7 @@ numpy==2.4.4
 pandas==2.2.3
 pyogrio==0.12.1
 pyproj==3.7.2
+psycopg2-binary==2.9.12
 scikit-learn==1.7.2
 shapely==2.1.2
 SQLAlchemy==2.0.49

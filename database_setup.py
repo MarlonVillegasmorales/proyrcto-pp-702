@@ -7,6 +7,7 @@ mantener compatibilidad entre SQLite y PostgreSQL.
 
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import datetime, time
 from pathlib import Path
@@ -94,7 +95,7 @@ class Oferente(Base):
 def crear_base_de_datos(ruta: str | Path = "sistema_vinculacion.db") -> None:
     """Crea las tablas OLTP si todavía no existen."""
 
-    database_url = f"sqlite:///{Path(ruta)}"
+    database_url = os.getenv("DATABASE_URL") or f"sqlite:///{Path(ruta)}"
     engine = create_engine(database_url)
     try:
         Base.metadata.create_all(engine)
