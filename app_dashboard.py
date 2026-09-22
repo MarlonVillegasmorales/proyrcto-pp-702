@@ -767,7 +767,7 @@ def main() -> None:
         unsafe_allow_html=True,
     )
     visor, simulador, transparencia = st.tabs(
-        ["🗺️ Visor Territorial", "🤝 Simulador de Vinculación", "🛡️ Transparencia"]
+        [" Visor Territorial", " Simulador de Vinculación", " Transparencia"]
     )
     with visor:
         mostrar_visor_territorial(dataset)
