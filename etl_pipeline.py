@@ -119,25 +119,42 @@ def _agregar_infraestructura(mapa: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 
 def _agregar_enut(enut: pd.DataFrame) -> dict[str, float]:
-    """Calcula KPIs agregados de pobreza de tiempo sin territorializarlos."""
+    """Calcula KPIs agregados de cuidado sin territorializarlos."""
 
     requeridas = {
-        "poblacion_estimada_12_mas",
         "personas_estimadas_que_realizan_cuidado",
-        "horas_promedio_semanales_cuidado_todos",
+        "horas_promedio_semanales_cuidado_entre_cuidadores",
     }
     faltantes = requeridas.difference(enut.columns)
     if faltantes:
         raise ValueError(f"ENUT no contiene columnas requeridas: {sorted(faltantes)}")
-    poblacion = enut["poblacion_estimada_12_mas"].sum()
-    cuidado = enut["personas_estimadas_que_realizan_cuidado"].sum()
-    horas = (
-        enut["horas_promedio_semanales_cuidado_todos"] * enut["poblacion_estimada_12_mas"]
-    ).sum() / poblacion
+    cuidado = pd.to_numeric(
+        enut["personas_estimadas_que_realizan_cuidado"], errors="coerce"
+    ).fillna(0)
+    horas_semanales = pd.to_numeric(
+        enut["horas_promedio_semanales_cuidado_entre_cuidadores"],
+        errors="coerce",
+    )
+    if horas_semanales.isna().any():
+        raise ValueError(
+            "ENUT contiene horas semanales de cuidado no válidas."
+        )
+    total_cuidadores = cuidado.sum()
+    if total_cuidadores <= 0:
+        raise ValueError(
+            "ENUT no contiene un total positivo de personas cuidadoras."
+        )
+    horas = (horas_semanales * cuidado).sum() / total_cuidadores
+    poblacion = pd.to_numeric(
+        enut.get("poblacion_estimada_12_mas", pd.Series(dtype=float)),
+        errors="coerce",
+    ).fillna(0).sum()
     return {
         "enut_poblacion_12_mas": float(poblacion),
-        "enut_personas_que_cuidan": float(cuidado),
-        "enut_porcentaje_que_cuida": float(cuidado / poblacion * 100),
+        "enut_personas_que_cuidan": float(total_cuidadores),
+        "enut_porcentaje_que_cuida": float(
+            total_cuidadores / poblacion * 100
+        ) if poblacion > 0 else 0.0,
         "enut_horas_promedio_cuidado": float(horas),
     }
 
@@ -157,6 +174,26 @@ def _validar_indicadores_macro(macro: pd.DataFrame) -> dict[str, str]:
         for _, fila in macro.iterrows()
         if pd.notna(fila["indicador"])
     }
+
+
+def _extraer_horas_cuidado_mujeres(macro: pd.DataFrame) -> float:
+    """Extrae las horas semanales de cuidado de mujeres de la fuente macro."""
+
+    indicador = "Horas semanales promedio de cuidado (Mujeres)"
+    filas = macro.loc[macro["indicador"].eq(indicador), "valor"]
+    if filas.empty:
+        raise ValueError(
+            f"Indicadores macro no contiene el indicador requerido: {indicador}"
+        )
+    coincidencia = re.search(r"(\d+(?:[.,]\d+)?)", str(filas.iloc[0]))
+    if coincidencia is None:
+        raise ValueError(
+            f"El valor del indicador {indicador} no contiene horas numéricas."
+        )
+    horas = float(coincidencia.group(1).replace(",", "."))
+    if horas <= 0:
+        raise ValueError(f"El valor del indicador {indicador} debe ser positivo.")
+    return horas
 
 
 def _poblacion_dependiente(censo: pd.DataFrame) -> pd.Series:
@@ -291,6 +328,9 @@ def construir_dataset_consolidado(
         )
     consolidado = consolidado.sort_values("alcaldia").reset_index(drop=True)
     consolidado.attrs["indicadores_pobreza_tiempo_cdmx"] = _agregar_enut(enut)
+    consolidado.attrs["indicadores_pobreza_tiempo_cdmx"][
+        "enut_horas_cuidado_mujeres"
+    ] = _extraer_horas_cuidado_mujeres(macro)
     consolidado.attrs["fuente_pobreza_tiempo"] = Path(ruta_enut).name
     consolidado.attrs["indicadores_macro_economia_cuidado"] = (
         _validar_indicadores_macro(macro)

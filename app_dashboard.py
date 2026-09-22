@@ -104,6 +104,33 @@ st.markdown(
         [data-testid="stAlert"] {
             color: #31333F;
         }
+        @media (max-width: 768px) {
+            .block-container {
+                padding: 1rem 0.75rem 2rem;
+            }
+            [data-testid="stHorizontalBlock"] {
+                flex-wrap: wrap;
+                gap: 0.75rem;
+            }
+            [data-testid="stMetric"] {
+                min-width: calc(50% - 0.5rem);
+                padding: 0.75rem;
+            }
+            [data-testid="stMetricValue"] {
+                font-size: 1.35rem;
+            }
+            [data-baseweb="tab-list"] {
+                overflow-x: auto;
+                white-space: nowrap;
+            }
+            [data-testid="stRadio"] > div {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            iframe {
+                max-width: 100%;
+            }
+        }
     </style>
     """,
     unsafe_allow_html=True,
@@ -238,8 +265,8 @@ def _metricas_principales(dataset: pd.DataFrame) -> None:
 def _mostrar_contexto_enut(dataset: pd.DataFrame) -> None:
     indicadores = dataset.attrs["indicadores_pobreza_tiempo_cdmx"]
     st.caption(
-        "Contexto ENUT para la CDMX: la fuente no contiene alcaldía, por lo que "
-        "sus valores no se asignan artificialmente a cada polígono."
+        "Nota: Los indicadores de la ENUT 2024 reflejan la realidad estructural "
+        "del trabajo de cuidado a nivel metropolitano (CDMX)."
     )
     columnas = st.columns(3)
     columnas[0].metric(
@@ -251,8 +278,8 @@ def _mostrar_contexto_enut(dataset: pd.DataFrame) -> None:
         f"{indicadores['enut_porcentaje_que_cuida']:.1f}%",
     )
     columnas[2].metric(
-        "Horas semanales de cuidado",
-        f"{indicadores['enut_horas_promedio_cuidado']:.1f}",
+        "Horas de cuidado semanales (Mujeres)",
+        f"{indicadores['enut_horas_cuidado_mujeres']:.1f}",
     )
 
 
