@@ -20,6 +20,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_OBSERVATORIO = ROOT_DIR / "datos_observatorio_cuidado_alcaldias_cdmx.csv"
 DEFAULT_CENSO = ROOT_DIR / "base_censo_CDMX_observatorio_v1.csv"
 DEFAULT_ENUT = ROOT_DIR / "ENUT_2024_CDMX_resumen_ponderado.csv"
+DEFAULT_MACRO = ROOT_DIR / "indicadores_macro_economia_cuidado.csv"
 DEFAULT_SHAPEFILE = (
     ROOT_DIR / "visualizacion" / "Equipamiento_de_asistencia_social.shp"
 )
@@ -141,19 +142,121 @@ def _agregar_enut(enut: pd.DataFrame) -> dict[str, float]:
     }
 
 
+def _validar_indicadores_macro(macro: pd.DataFrame) -> dict[str, str]:
+    """Valida y conserva los indicadores macroeconómicos declarados como fuente."""
+
+    requeridas = {"indicador", "valor", "fuente"}
+    faltantes = requeridas.difference(macro.columns)
+    if faltantes:
+        raise ValueError(
+            "Indicadores macro no contiene columnas requeridas: "
+            f"{sorted(faltantes)}"
+        )
+    return {
+        str(fila["indicador"]): str(fila["valor"])
+        for _, fila in macro.iterrows()
+        if pd.notna(fila["indicador"])
+    }
+
+
+def _poblacion_dependiente(censo: pd.DataFrame) -> pd.Series:
+    """Suma la población de 0 a 14 y de 60 años o más del Censo."""
+
+    grupos_edad = [
+        "pob_De 0 a 4 años",
+        "pob_De 5 a 9 años",
+        "pob_De 10 a 14 años",
+        "pob_De 60 a 64 años",
+        "pob_De 65 a 69 años",
+        "pob_De 70 a 74 años",
+        "pob_De 75 a 79 años",
+        "pob_De 80 a 84 años",
+        "pob_85 años y más",
+    ]
+    faltantes = [columna for columna in grupos_edad if columna not in censo.columns]
+    if faltantes:
+        raise ValueError(
+            "Censo no contiene columnas de población dependiente: "
+            + ", ".join(faltantes)
+        )
+    return censo[grupos_edad].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
+
+
+def _calcular_abandono_laboral_cuidados(
+    enut: pd.DataFrame, territorial: pd.DataFrame, censo: pd.DataFrame
+) -> pd.Series:
+    """Obtiene el abandono laboral por cuidados y lo asigna a cada alcaldía.
+
+    La ENUT no tiene desglose territorial. Cuando una fuente territorial no
+    aporta el indicador, el total CDMX se distribuye según la población
+    dependiente del Censo.
+    """
+
+    columna_exacta = "abandono_laboral_cuidados"
+    if columna_exacta in territorial.columns:
+        valores = pd.to_numeric(territorial[columna_exacta], errors="coerce")
+        if valores.notna().all():
+            return valores
+
+    if {
+        "personas_estimadas_que_abandonan_el_mercado_laboral_por_cuidado",
+    }.issubset(enut.columns):
+        total_abandono = pd.to_numeric(
+            enut["personas_estimadas_que_abandonan_el_mercado_laboral_por_cuidado"],
+            errors="coerce",
+        ).sum()
+    else:
+        columnas_requeridas = {
+            "personas_estimadas_que_realizan_cuidado",
+            "personas_estimadas_cuidado_y_trabajo_mercado",
+        }
+        faltantes = columnas_requeridas.difference(enut.columns)
+        if faltantes:
+            raise ValueError(
+                "ENUT no permite calcular abandono laboral por cuidados; "
+                f"faltan columnas: {sorted(faltantes)}"
+            )
+        cuidado = pd.to_numeric(
+            enut["personas_estimadas_que_realizan_cuidado"], errors="coerce"
+        ).fillna(0)
+        cuidado_y_trabajo = pd.to_numeric(
+            enut["personas_estimadas_cuidado_y_trabajo_mercado"], errors="coerce"
+        ).fillna(0)
+        total_abandono = (cuidado - cuidado_y_trabajo).clip(lower=0).sum()
+
+    dependientes = _poblacion_dependiente(censo)
+    total_dependientes = dependientes.sum()
+    if total_dependientes <= 0:
+        raise ValueError(
+            "No se puede estimar abandono laboral: la población dependiente "
+            "del Censo no tiene un total positivo."
+        )
+    participacion = dependientes / total_dependientes
+    return (
+        territorial["alcaldia"]
+        .map(dict(zip(censo["alcaldia"], participacion)))
+        .fillna(0)
+        * float(total_abandono)
+    )
+
+
 def construir_dataset_consolidado(
     *,
     ruta_observatorio: str | Path = DEFAULT_OBSERVATORIO,
     ruta_censo: str | Path = DEFAULT_CENSO,
     ruta_enut: str | Path = DEFAULT_ENUT,
+    ruta_macro: str | Path = DEFAULT_MACRO,
     ruta_shapefile: str | Path = DEFAULT_SHAPEFILE,
 ) -> gpd.GeoDataFrame:
-    """Integra infraestructura, censos y KPIs de cuidado para el Dashboard."""
+    """Integra exclusivamente las cinco fuentes de evidencia del proyecto."""
 
-    tablas = cargar_tabulares([ruta_observatorio, ruta_censo, ruta_enut])
+    tablas = cargar_tabulares(
+        [ruta_observatorio, ruta_censo, ruta_enut, ruta_macro]
+    )
     observatorio = tablas[Path(ruta_observatorio).stem]
     censo = tablas[Path(ruta_censo).stem]
     enut = tablas[Path(ruta_enut).stem]
+    macro = tablas[Path(ruta_macro).stem]
 
     observatorio = observatorio.loc[observatorio["alcaldia"] != "TOTAL CDMX"].copy()
     censo = censo.drop_duplicates(subset="alcaldia")
@@ -174,6 +277,9 @@ def construir_dataset_consolidado(
     consolidado = gpd.GeoDataFrame(
         consolidado, geometry="geometry", crs=infraestructura.crs
     )
+    consolidado["abandono_laboral_cuidados"] = _calcular_abandono_laboral_cuidados(
+        enut, consolidado, censo
+    )
 
     if "cobertura_caci_0_2_pct" in consolidado:
         consolidado["brecha_cobertura_caci_0_2_pct"] = (
@@ -186,6 +292,19 @@ def construir_dataset_consolidado(
     consolidado = consolidado.sort_values("alcaldia").reset_index(drop=True)
     consolidado.attrs["indicadores_pobreza_tiempo_cdmx"] = _agregar_enut(enut)
     consolidado.attrs["fuente_pobreza_tiempo"] = Path(ruta_enut).name
+    consolidado.attrs["indicadores_macro_economia_cuidado"] = (
+        _validar_indicadores_macro(macro)
+    )
+    consolidado.attrs["fuentes_evidencia"] = tuple(
+        Path(ruta).name
+        for ruta in (
+            ruta_enut,
+            ruta_censo,
+            ruta_shapefile,
+            ruta_observatorio,
+            ruta_macro,
+        )
+    )
     return consolidado
 
 

@@ -8,26 +8,105 @@ from __future__ import annotations
 import html
 import re
 import unicodedata
-import uuid
 from datetime import time
+from pathlib import Path
 
 import folium
 import pandas as pd
 import streamlit as st
 from branca.colormap import linear
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
 from streamlit_folium import st_folium
 
+from database_setup import Base, Oferente, Solicitud
 from etl_pipeline import construir_dataset_consolidado
 from modelo_matching import MotorMatching
 
 
 CAPACIDAD_PROMEDIO_GUARDERIA = 100
 RADIO_MATCHING_KM = 10.0
+DATABASE_PATH = Path(__file__).resolve().parent / "sistema_vinculacion.db"
+FUENTE_ACADEMICA = (
+    "Fuente: Elaboración propia del Observatorio del Cuidado CDMX con datos "
+    "geográficos y censales (INEGI 2020), infraestructura de asistencia social "
+    "y estimaciones de la Encuesta Nacional para el Sistema de Cuidados "
+    "(ENUT 2024)."
+)
 
 st.set_page_config(
-    page_title="Observatorio de la Economía del Cuidado",
-    page_icon="🫶",
     layout="wide",
+    page_title="Observatorio del Cuidado CDMX",
+    page_icon="💜",
+)
+
+st.markdown(
+    """
+    <style>
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
+        html, body, [class*="css"] {
+            color: #31333F;
+        }
+        [data-testid="stAppViewContainer"] {
+            background: #F0F2F6;
+            color: #31333F;
+        }
+        [data-testid="stHeader"] {
+            background: #F0F2F6;
+        }
+        .block-container {
+            padding-top: 2.5rem;
+            padding-bottom: 3rem;
+        }
+        [data-testid="stAppViewContainer"] h1,
+        [data-testid="stAppViewContainer"] h2,
+        [data-testid="stAppViewContainer"] h3,
+        [data-testid="stAppViewContainer"] p,
+        [data-testid="stAppViewContainer"] label,
+        [data-testid="stAppViewContainer"] [data-testid="stMarkdownContainer"] {
+            color: #31333F;
+        }
+        [data-testid="stMetric"] {
+            background: #FFFFFF;
+            border: 1px solid #D7D9E0;
+            border-radius: 16px;
+            padding: 1rem 1.1rem;
+            box-shadow: 0 8px 24px rgba(30, 41, 59, 0.10);
+        }
+        [data-testid="stMetricLabel"],
+        [data-testid="stMetricValue"],
+        [data-testid="stMetricDelta"] {
+            color: #31333F !important;
+        }
+        [data-baseweb="tab-list"] {
+            background: #FFFFFF;
+            border-radius: 12px;
+            padding: 0.25rem;
+        }
+        [data-baseweb="tab"] {
+            color: #31333F !important;
+            font-weight: 600;
+        }
+        [data-baseweb="tab"][aria-selected="true"] {
+            color: #5B21B6 !important;
+            border-bottom-color: #5B21B6 !important;
+        }
+        [data-testid="stTextInput"] input,
+        [data-testid="stNumberInput"] input,
+        [data-testid="stTimeInput"] input,
+        [data-testid="stSelectbox"] > div,
+        [data-testid="stMultiSelect"] > div {
+            background: #FFFFFF;
+            color: #31333F;
+        }
+        [data-testid="stAlert"] {
+            color: #31333F;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
@@ -89,13 +168,21 @@ def _formato_alcaldia(valor: str) -> str:
     return str(valor).title()
 
 
-def _crear_mapa(dataset: pd.DataFrame) -> folium.Map:
+def _crear_mapa(dataset: pd.DataFrame, metrica: str) -> folium.Map:
     mapa_data = dataset.to_crs(epsg=4326).copy()
-    valores = mapa_data["personas_afectadas"].astype(float)
+    columna_metrica = {
+        "Déficit de Infraestructura (Guarderías)": "personas_afectadas",
+        "Abandono Laboral por Cuidados": "abandono_laboral_cuidados",
+    }[metrica]
+    valores = pd.to_numeric(mapa_data[columna_metrica], errors="coerce").fillna(0)
     minimo = float(valores.min())
     maximo = max(float(valores.max()), minimo + 1)
-    escala = linear.Blues_09.scale(minimo, maximo)
-    escala.caption = "Personas afectadas sin acceso"
+    escala = (
+        linear.Purples_09.scale(minimo, maximo)
+        if columna_metrica == "abandono_laboral_cuidados"
+        else linear.Blues_09.scale(minimo, maximo)
+    )
+    escala.caption = metrica
 
     mapa = folium.Map(
         location=[19.33, -99.15],
@@ -105,25 +192,26 @@ def _crear_mapa(dataset: pd.DataFrame) -> folium.Map:
     )
     for _, fila in mapa_data.iterrows():
         nombre = _formato_alcaldia(fila["alcaldia"])
+        valor_metrica = pd.to_numeric(fila[columna_metrica], errors="coerce")
+        valor_metrica = 0.0 if pd.isna(valor_metrica) else float(valor_metrica)
         text = (
             f"Alcaldía: {html.escape(nombre)}<br>"
-            f"Población que requiere cuidado: "
-            f"{fila['poblacion_dependiente']:,.0f} personas.<br>"
-            f"Guarderías disponibles: {fila['No_Guard']:,.0f} centros.<br>"
-            f"Población afectada sin acceso: "
-            f"{fila['personas_afectadas']:,.0f} personas."
+            f"Déficit de cupos: {fila['personas_afectadas']:,.0f} "
+            "infantes sin guardería.<br>"
+            f"Abandono laboral: {fila['abandono_laboral_cuidados']:,.0f} "
+            "personas dejaron su empleo para cuidar."
         )
         folium.GeoJson(
             data=fila.geometry.__geo_interface__,
-            style_function=lambda _, color=escala(fila["personas_afectadas"]): {
+            style_function=lambda _, color=escala(valor_metrica): {
                 "fillColor": color,
-                "color": "#334155",
-                "weight": 1,
-                "fillOpacity": 0.82,
+                "color": "#475569",
+                "weight": 1.2,
+                "fillOpacity": 0.86,
             },
             highlight_function=lambda _: {
                 "weight": 3,
-                "color": "#0f172a",
+                "color": "#7c3aed",
                 "fillOpacity": 0.95,
             },
         ).add_child(folium.Tooltip(text, sticky=True)).add_to(mapa)
@@ -171,14 +259,29 @@ def _mostrar_contexto_enut(dataset: pd.DataFrame) -> None:
 def mostrar_visor_territorial(dataset) -> None:
     st.header("Visor Territorial")
     st.write(
-        "La escala oscura identifica más personas afectadas sin acceso estimado. "
+        "Explora el impacto territorial del cuidado con una métrica a la vez. "
         f"Se estima una capacidad de {CAPACIDAD_PROMEDIO_GUARDERIA} personas "
         "por guardería para convertir infraestructura en impacto absoluto."
     )
+    metrica = st.radio(
+        "Métrica del mapa",
+        [
+            "Déficit de Infraestructura (Guarderías)",
+            "Abandono Laboral por Cuidados",
+        ],
+        horizontal=True,
+    )
     _mostrar_contexto_enut(dataset)
-    st_folium(_crear_mapa(dataset), use_container_width=True, height=560)
+    st_folium(_crear_mapa(dataset, metrica), use_container_width=True, height=560)
+    st.caption(FUENTE_ACADEMICA)
     tabla = dataset[
-        ["alcaldia", "poblacion_dependiente", "No_Guard", "personas_afectadas"]
+        [
+            "alcaldia",
+            "poblacion_dependiente",
+            "No_Guard",
+            "personas_afectadas",
+            "abandono_laboral_cuidados",
+        ]
     ].copy()
     tabla["alcaldia"] = tabla["alcaldia"].map(_formato_alcaldia)
     tabla.columns = [
@@ -186,6 +289,7 @@ def mostrar_visor_territorial(dataset) -> None:
         "Población que requiere cuidado",
         "Guarderías disponibles",
         "Personas afectadas sin acceso",
+        "Abandono laboral por cuidados",
     ]
     st.dataframe(
         tabla.style.format(
@@ -193,6 +297,7 @@ def mostrar_visor_territorial(dataset) -> None:
                 "Población que requiere cuidado": "{:,.0f}",
                 "Guarderías disponibles": "{:,.0f}",
                 "Personas afectadas sin acceso": "{:,.0f}",
+                "Abandono laboral por cuidados": "{:,.0f}",
             }
         ),
         use_container_width=True,
@@ -200,110 +305,177 @@ def mostrar_visor_territorial(dataset) -> None:
     )
 
 
-def _filas_sesion(tipo: str) -> list[dict[str, object]]:
-    clave = "solicitudes_simulador" if tipo == "Solicitud" else "oferentes_simulador"
-    return st.session_state.setdefault(clave, [])
+def seed_datos_simulacion(
+    dataset: pd.DataFrame,
+    alcaldia: str,
+    ruta_db: str | Path = DATABASE_PATH,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Si hace falta, siembra el piloto con proporciones del Censo territorial."""
+
+    ruta = Path(ruta_db).resolve()
+    engine = create_engine(f"sqlite:///{ruta}")
+    try:
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            solicitudes_existentes = session.scalar(
+                select(Solicitud).where(Solicitud.alcaldia == alcaldia)
+            )
+            oferentes_existentes = session.scalar(
+                select(Oferente).where(Oferente.alcaldia == alcaldia)
+            )
+
+            if solicitudes_existentes is None or oferentes_existentes is None:
+                fila = dataset.loc[dataset["alcaldia"] == alcaldia]
+                if fila.empty:
+                    raise ValueError(f"No existe evidencia territorial para {alcaldia}.")
+                fila = fila.iloc[0]
+                dependientes = pd.to_numeric(
+                    dataset["poblacion_dependiente"], errors="coerce"
+                ).fillna(0)
+                total_dependientes = dependientes.sum()
+                promedio_dependientes = dependientes[dependientes > 0].mean()
+                if total_dependientes <= 0 or promedio_dependientes <= 0:
+                    raise ValueError(
+                        "No se puede sembrar el simulador sin población dependiente positiva."
+                    )
+
+                poblacion_zona = float(fila["poblacion_dependiente"])
+                solicitudes = max(
+                    15, round(15 * poblacion_zona / promedio_dependientes)
+                )
+                afectados = max(float(fila["personas_afectadas"]), 0)
+                cobertura = max(
+                    0.05,
+                    1 - min(afectados / max(poblacion_zona, 1), 0.95),
+                )
+                oferentes = max(1, round(solicitudes * cobertura))
+                centroide = dataset.loc[
+                    dataset["alcaldia"] == alcaldia
+                ].to_crs(epsg=4326).geometry.iloc[0].centroid
+                colonia = f"Zona piloto {alcaldia.title()}"
+                if solicitudes_existentes is None:
+                    session.add_all(
+                        [
+                            Solicitud(
+                                alcaldia=alcaldia,
+                                colonia=colonia,
+                                latitud=float(centroide.y),
+                                longitud=float(centroide.x),
+                                horario_requerido_inicio=time(8),
+                                horario_requerido_fin=time(12),
+                                dias_requeridos="lun,mar",
+                            )
+                            for _ in range(solicitudes)
+                        ]
+                    )
+                if oferentes_existentes is None:
+                    session.add_all(
+                        [
+                            Oferente(
+                                alcaldia=alcaldia,
+                                colonia=colonia,
+                                latitud=float(centroide.y),
+                                longitud=float(centroide.x),
+                                horario_ofrecido_inicio=time(8),
+                                horario_ofrecido_fin=time(12),
+                                dias_ofrecidos="lun,mar",
+                            )
+                            for _ in range(oferentes)
+                        ]
+                    )
+                session.commit()
+
+            solicitudes_rows = session.scalars(
+                select(Solicitud).where(Solicitud.alcaldia == alcaldia)
+            ).all()
+            oferentes_rows = session.scalars(
+                select(Oferente).where(Oferente.alcaldia == alcaldia)
+            ).all()
+            solicitudes_frame = pd.DataFrame(
+                [
+                    {
+                        "solicitud_id": fila.solicitud_id,
+                        "latitud": fila.latitud,
+                        "longitud": fila.longitud,
+                        "horario_requerido_inicio": fila.horario_requerido_inicio,
+                        "horario_requerido_fin": fila.horario_requerido_fin,
+                        "dias_requeridos": fila.dias_requeridos,
+                    }
+                    for fila in solicitudes_rows
+                ]
+            )
+            oferentes_frame = pd.DataFrame(
+                [
+                    {
+                        "oferente_id": fila.oferente_id,
+                        "latitud": fila.latitud,
+                        "longitud": fila.longitud,
+                        "horario_ofrecido_inicio": fila.horario_ofrecido_inicio,
+                        "horario_ofrecido_fin": fila.horario_ofrecido_fin,
+                        "dias_ofrecidos": fila.dias_ofrecidos,
+                    }
+                    for fila in oferentes_rows
+                ]
+            )
+            return solicitudes_frame, oferentes_frame
+    finally:
+        engine.dispose()
 
 
-def _entrada_perfil(tipo: str) -> dict[str, object]:
-    prefijo = tipo.lower()
-    st.subheader(f"Nueva {tipo.lower()}")
-    colonia = st.text_input("Colonia", value="Centro", key=f"{prefijo}_colonia")
-    latitud = st.number_input(
-        "Latitud", -90.0, 90.0, 19.355, format="%.6f", key=f"{prefijo}_latitud"
-    )
-    longitud = st.number_input(
-        "Longitud", -180.0, 180.0, -99.05, format="%.6f", key=f"{prefijo}_longitud"
-    )
-    inicio = st.time_input("Inicio", value=time(8), key=f"{prefijo}_inicio")
-    fin = st.time_input("Fin", value=time(12), key=f"{prefijo}_fin")
-    dias = st.multiselect(
-        "Días",
-        ["lun", "mar", "mie", "jue", "vie", "sab", "dom"],
-        default=["lun", "mar"],
-        key=f"{prefijo}_dias",
-    )
-    return {
-        "colonia": colonia,
-        "latitud": latitud,
-        "longitud": longitud,
-        "inicio": inicio,
-        "fin": fin,
-        "dias": ",".join(dias),
-    }
-
-
-def mostrar_simulador() -> None:
-    st.header("Simulador de Vinculación")
+def mostrar_simulador(dataset: pd.DataFrame) -> None:
+    st.header("Cuando la demanda supera la oferta")
     st.write(
-        "Simula perfiles del piloto de Iztapalapa. Los identificadores se generan "
-        "como UUID y no se solicitan nombres reales."
+        "Imagina una familia que necesita apoyo para cuidar a sus seres queridos. "
+        "Esta experiencia muestra qué ocurre cuando muchas familias solicitan "
+        "ayuda y solo hay unas pocas cuidadoras disponibles."
     )
-    solicitud_col, oferente_col = st.columns(2)
-    with solicitud_col:
-        solicitud = _entrada_perfil("Solicitud")
-        if st.button("Agregar solicitud", type="primary", use_container_width=True):
-            if not solicitud["dias"] or solicitud["inicio"] >= solicitud["fin"]:
-                st.error("Revisa días y rango horario.")
-            elif len(_filas_sesion("Solicitud")) >= 15:
-                st.error("El piloto está limitado a 15 solicitudes.")
-            else:
-                _filas_sesion("Solicitud").append(solicitud)
-                st.success("Solicitud agregada.")
-    with oferente_col:
-        oferente = _entrada_perfil("Oferente")
-        if st.button("Agregar oferente", use_container_width=True):
-            if not oferente["dias"] or oferente["inicio"] >= oferente["fin"]:
-                st.error("Revisa días y rango horario.")
-            elif len(_filas_sesion("Oferente")) >= 6:
-                st.error("El piloto está limitado a 6 oferentes.")
-            else:
-                _filas_sesion("Oferente").append(oferente)
-                st.success("Oferente agregado.")
+    alcaldias = sorted(dataset["alcaldia"].dropna().unique())
+    zona = st.selectbox(
+        "Elige una zona para observar el piloto",
+        alcaldias or ["IZTAPALAPA"],
+        index=(alcaldias.index("IZTAPALAPA") if "IZTAPALAPA" in alcaldias else 0),
+    )
+    st.caption(
+        f"Escenario ilustrativo para {zona.title()}: la cantidad de familias "
+        "y cuidadoras se estima con la población dependiente y el déficit "
+        "territorial observados en las fuentes del proyecto."
+    )
 
-    solicitudes = _filas_sesion("Solicitud")
-    oferentes = _filas_sesion("Oferente")
-    st.caption(f"{len(solicitudes)} solicitudes · {len(oferentes)} oferentes")
-    if st.button("Ejecutar matching", type="primary", use_container_width=True):
-        solicitudes_frame = pd.DataFrame(
-            [
-                {
-                    "solicitud_id": str(uuid.uuid4()),
-                    "alcaldia": "IZTAPALAPA",
-                    "latitud": perfil["latitud"],
-                    "longitud": perfil["longitud"],
-                    "horario_requerido_inicio": perfil["inicio"],
-                    "horario_requerido_fin": perfil["fin"],
-                    "dias_requeridos": perfil["dias"],
-                }
-                for perfil in solicitudes
-            ]
+    if st.button(
+        "Ejecutar Simulación de Asignación",
+        type="primary",
+        use_container_width=True,
+    ):
+        solicitudes_frame, oferentes_frame = seed_datos_simulacion(
+            dataset, zona
         )
-        oferentes_frame = pd.DataFrame(
-            [
-                {
-                    "oferente_id": str(uuid.uuid4()),
-                    "alcaldia": "IZTAPALAPA",
-                    "latitud": perfil["latitud"],
-                    "longitud": perfil["longitud"],
-                    "horario_ofrecido_inicio": perfil["inicio"],
-                    "horario_ofrecido_fin": perfil["fin"],
-                    "dias_ofrecidos": perfil["dias"],
-                }
-                for perfil in oferentes
-            ]
+        resultado = MotorMatching(max_distance_km=RADIO_MATCHING_KM).emparejar(
+            solicitudes_frame, oferentes_frame
         )
-        if solicitudes_frame.empty:
-            st.info("Agrega al menos una solicitud.")
+        familias = len(resultado)
+        vinculadas = int((resultado["estado"] == "emparejada").sum())
+        sin_cobertura = familias - vinculadas
+
+        columnas = st.columns(3)
+        columnas[0].metric("Familias Solicitantes", f"{familias:,}")
+        columnas[1].metric("Familias Vinculadas", f"{vinculadas:,}")
+        columnas[2].metric("Familias sin Cobertura", f"{sin_cobertura:,}")
+
+        if sin_cobertura:
+            st.warning(
+                f"{sin_cobertura} familias no pudieron recibir apoyo en esta "
+                "simulación porque la oferta disponible se agotó."
+            )
         else:
-            resultado = MotorMatching(max_distance_km=RADIO_MATCHING_KM).emparejar(
-                solicitudes_frame, oferentes_frame
-            )
-            st.metric(
-                "Solicitudes emparejadas",
-                f"{(resultado['estado'] == 'emparejada').sum():,.0f}/{len(resultado):,.0f}",
-            )
-            st.dataframe(resultado, use_container_width=True, hide_index=True)
+            st.success("Todas las familias encontraron una cuidadora compatible.")
+
+        st.info(
+            "Transparencia del Algoritmo: El motor prioriza cercanía y horarios, "
+            f"pero debido al déficit estructural de oferta, {sin_cobertura} "
+            "familias no pudieron ser vinculadas. Ningún dato personal fue "
+            "expuesto (Privacidad por Diseño - UCA 1)."
+        )
+    st.caption(FUENTE_ACADEMICA)
 
 
 def mostrar_transparencia() -> None:
@@ -315,7 +487,8 @@ def mostrar_transparencia() -> None:
     )
     with st.expander("UCA 1 · Privacidad por diseño", expanded=False):
         st.markdown(
-            "- `Solicitudes` y `Oferentes` usan UUID seudonimizados.\n"
+            "- `Solicitudes` y `Oferentes` usan identificadores internos "
+            "seudonimizados.\n"
             "- No se almacenan nombres reales, teléfonos, correos ni género.\n"
             "- El simulador no persiste datos personales.\n"
             "- La capa operativa conserva únicamente ubicación y horarios "
@@ -341,18 +514,19 @@ def mostrar_transparencia() -> None:
 
 def main() -> None:
     dataset = cargar_evidencia()
-    st.title("Observatorio de la Economía del Cuidado")
+    st.title("Observatorio del Cuidado CDMX")
     st.caption(
-        "CDMX · Evidencia territorial para decisiones de cuidado · UCA 3"
+        "Evidencia territorial para decisiones de cuidado · UCA 3"
     )
     _metricas_principales(dataset)
+    st.caption(FUENTE_ACADEMICA)
     visor, simulador, transparencia = st.tabs(
         ["Visor Territorial", "Simulador de Vinculación", "Transparencia Algorítmica"]
     )
     with visor:
         mostrar_visor_territorial(dataset)
     with simulador:
-        mostrar_simulador()
+        mostrar_simulador(dataset)
     with transparencia:
         mostrar_transparencia()
 
